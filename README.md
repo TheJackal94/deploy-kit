@@ -33,6 +33,13 @@ Roll back: revert the commit in GitHub (or `git revert`) and push; it redeploys 
 If this repo is private, allow your other repos to use it: **deploy-kit → Settings → Actions → General →
 Access → "Accessible from repositories owned by the user"**.
 
+## Safety lock
+
+On its first deploy, each project leaves a `.deploy-owner` file in its host folder naming its repo. Every later
+deploy (cPanel FTP/SSH) reads that file first: if it names a different repo, for example because one site's
+FTP login was pasted into another repo's secrets, the deploy is refused before anything is uploaded and
+Telegram gets a 🔒 message. To hand a folder to another repo on purpose, delete `.deploy-owner` on the host.
+
 ## cPanel notes
 
 - FTP details: cPanel → **FTP Accounts**. Best practice is a dedicated FTP account per site, limited to that

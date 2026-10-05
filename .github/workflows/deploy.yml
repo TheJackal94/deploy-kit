@@ -93,6 +93,50 @@ jobs:
         if: steps.precheck.outputs.ready == 'true' && (inputs.build_command != '' && (inputs.target == 'cpanel-ftp' || inputs.target == 'cpanel-ssh' || inputs.target == 'netlify'))
         run: ${{ inputs.build_command }}
 
+      # ---------------------------------------------------------------- safety lock
+      # Each host folder carries a .deploy-owner marker naming the repo that deploys there. If the login in this
+      # repo's secrets points at another project's folder, refuse before touching anything.
+      - name: Safety lock (is this the right site?)
+        id: lock
+        if: steps.precheck.outputs.ready == 'true' && (inputs.target == 'cpanel-ftp' || inputs.target == 'cpanel-ssh')
+        env:
+          T: ${{ inputs.target }}
+          REPO: ${{ github.repository }}
+          DIR: ${{ inputs.server_dir }}
+          FTP_SERVER: ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          d="${DIR#./}"; d="${d#/}"; d="${d%/}"; path="${d:+$d/}.deploy-owner"
+          set +e
+          if [ "$T" = "cpanel-ftp" ]; then
+            owner=$(curl -sS --ssl-reqd --tls-max 1.2 --max-time 60 --user "$FTP_USERNAME:$FTP_PASSWORD" \
+                    "ftp://$FTP_SERVER/$path" 2>/tmp/lockerr); rc=$?
+            # 78 = file not found on the server: first deploy to this folder, no marker yet
+            if [ $rc -eq 78 ] || grep -qi "not found\|no such file\|550" /tmp/lockerr; then owner=""; rc=0; fi
+          else
+            mkdir -p ~/.ssh && echo "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+            ssh-keyscan -p "${SSH_PORT:-22}" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+            owner=$(ssh -i ~/.ssh/deploy_key -p "${SSH_PORT:-22}" "$SSH_USER@$SSH_HOST" "cat '$path' 2>/dev/null || true"); rc=$?
+          fi
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "::error::Couldn't log in to the host to check the safety lock (curl/ssh exit $rc): $(cat /tmp/lockerr 2>/dev/null)"
+            exit 1
+          fi
+          owner=$(printf '%s' "$owner" | tr -d '\r\n ')
+          if [ -n "$owner" ] && [ "$owner" != "$REPO" ]; then
+            echo "locked_by=$owner" >> "$GITHUB_OUTPUT"
+            echo "::error::Refused: that host folder belongs to $owner, not $REPO. Check this repo's FTP/SSH secrets."
+            exit 1
+          fi
+          echo "first=$([ -z "$owner" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "Safety lock OK (${owner:-no marker yet, this deploy will set it})"
+
       # ---------------------------------------------------------------- cPanel over FTPS
       - name: Deploy to cPanel (FTPS)
         if: steps.precheck.outputs.ready == 'true' && (inputs.target == 'cpanel-ftp')
@@ -125,12 +169,35 @@ jobs:
           mkdir -p ~/.ssh && echo "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
           PORT="${SSH_PORT:-22}"
           ssh-keyscan -p "$PORT" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
-          printf '%s\n' .git .github node_modules .DS_Store README.md > /tmp/exclude.txt
+          printf '%s\n' .git .github node_modules .DS_Store README.md .deploy-owner > /tmp/exclude.txt
           printf '%s\n' "${{ inputs.exclude }}" >> /tmp/exclude.txt
           SRC="${{ inputs.output_dir }}"; SRC="${SRC%/}/"
           DEST="${{ inputs.server_dir }}"; DEST="${DEST#/}"
           rsync -az --delete --exclude-from=/tmp/exclude.txt -e "ssh -i ~/.ssh/deploy_key -p $PORT" \
             "$SRC" "$SSH_USER@$SSH_HOST:$DEST"
+
+      # ---------------------------------------------------------------- claim the folder (first deploy)
+      - name: Set the safety-lock marker
+        if: steps.precheck.outputs.ready == 'true' && steps.lock.outputs.first == 'true'
+        env:
+          T: ${{ inputs.target }}
+          REPO: ${{ github.repository }}
+          DIR: ${{ inputs.server_dir }}
+          FTP_SERVER: ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          d="${DIR#./}"; d="${d#/}"; d="${d%/}"; path="${d:+$d/}.deploy-owner"
+          if [ "$T" = "cpanel-ftp" ]; then
+            printf '%s\n' "$REPO" | curl -sS --ssl-reqd --tls-max 1.2 --max-time 60 --user "$FTP_USERNAME:$FTP_PASSWORD" \
+              -T - "ftp://$FTP_SERVER/$path"
+          else
+            printf '%s\n' "$REPO" | ssh -i ~/.ssh/deploy_key -p "${SSH_PORT:-22}" "$SSH_USER@$SSH_HOST" "cat > '$path'"
+          fi
+          echo "Marker set: this folder now belongs to $REPO"
 
       # ---------------------------------------------------------------- Vercel
       - name: Deploy to Vercel
@@ -188,12 +255,15 @@ jobs:
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATUS: ${{ job.status }}
           READY: ${{ steps.precheck.outputs.ready }}
+          LOCKED_BY: ${{ steps.lock.outputs.locked_by }}
           MSG: ${{ github.event.head_commit.message }}
         run: |
           [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || exit 0
           RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           FIRST_LINE=$(printf '%s' "$MSG" | head -n1 | cut -c1-120)
-          if [ "$READY" = "false" ]; then
+          if [ -n "$LOCKED_BY" ]; then
+            TEXT="🔒 ${{ inputs.site_name }}: deploy REFUSED. The login in this repo's secrets points at the folder of $LOCKED_BY. Nothing was uploaded. Fix the secrets. $RUN"
+          elif [ "$READY" = "false" ]; then
             TEXT="⚠️ ${{ inputs.site_name }}: deploy skipped, its GitHub secrets aren't set yet."
           elif [ "$STATUS" = "success" ]; then
             TEXT="✅ ${{ inputs.site_name }} deployed (${{ inputs.target }})"
