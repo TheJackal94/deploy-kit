@@ -112,9 +112,11 @@ jobs:
           SSH_PORT: ${{ secrets.SSH_PORT }}
         run: |
           d="${DIR#./}"; d="${d#/}"; d="${d%/}"; path="${d:+$d/}.deploy-owner"
+          # --insecure: still encrypted (FTPS), but shared cPanel servers often present a certificate issued for
+          # another hostname; the FTP deploy step accepts it the same way.
           set +e
           if [ "$T" = "cpanel-ftp" ]; then
-            owner=$(curl -sS --ssl-reqd --tls-max 1.2 --max-time 60 --user "$FTP_USERNAME:$FTP_PASSWORD" \
+            owner=$(curl -sS --ssl-reqd --insecure --tls-max 1.2 --max-time 60 --user "$FTP_USERNAME:$FTP_PASSWORD" \
                     "ftp://$FTP_SERVER/$path" 2>/tmp/lockerr); rc=$?
             # 78 = file not found on the server: first deploy to this folder, no marker yet
             if [ $rc -eq 78 ] || grep -qi "not found\|no such file\|550" /tmp/lockerr; then owner=""; rc=0; fi
@@ -192,7 +194,7 @@ jobs:
         run: |
           d="${DIR#./}"; d="${d#/}"; d="${d%/}"; path="${d:+$d/}.deploy-owner"
           if [ "$T" = "cpanel-ftp" ]; then
-            printf '%s\n' "$REPO" | curl -sS --ssl-reqd --tls-max 1.2 --max-time 60 --user "$FTP_USERNAME:$FTP_PASSWORD" \
+            printf '%s\n' "$REPO" | curl -sS --ssl-reqd --insecure --tls-max 1.2 --max-time 60 --user "$FTP_USERNAME:$FTP_PASSWORD" \
               -T - "ftp://$FTP_SERVER/$path"
           else
             printf '%s\n' "$REPO" | ssh -i ~/.ssh/deploy_key -p "${SSH_PORT:-22}" "$SSH_USER@$SSH_HOST" "cat > '$path'"
