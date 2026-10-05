@@ -1,0 +1,207 @@
+# Reusable deploy workflow. Every project calls this with one small file (see templates/deploy.yml).
+# Pick a target per project; credentials live in that project's GitHub secrets, never in code.
+#
+#   target: cpanel-ftp   any cPanel host (Axxess, Afrihost, ...) over FTPS. Uploads only changed files.
+#           cpanel-ssh   cPanel/VPS with SSH: rsync, faster, can delete removed files safely.
+#           vercel       Vercel project (static, Next.js, etc.).
+#           netlify      Netlify site.
+#           supabase     Supabase database migrations + edge functions.
+#
+# Every run ends with a Telegram message to Riaan (✅ / 🔴) and, for websites, checks the live URL loads.
+name: deploy (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      target:        { type: string, required: true }
+      site_name:     { type: string, required: true }
+      site_url:      { type: string, default: "" }      # checked after deploy
+      expect_text:   { type: string, default: "" }      # optional text that must appear on the live page
+      node_version:  { type: string, default: "20" }
+      install_command: { type: string, default: "" }    # e.g. "npm ci"
+      build_command: { type: string, default: "" }      # e.g. "npm run build" (empty = plain HTML)
+      output_dir:    { type: string, default: "." }     # folder to upload, e.g. "dist" or "."
+      server_dir:    { type: string, default: "/public_html/" }  # cPanel destination folder
+      exclude:       { type: string, default: "" }      # extra paths to never upload, one per line
+    secrets:
+      FTP_SERVER: { required: false }
+      FTP_USERNAME: { required: false }
+      FTP_PASSWORD: { required: false }
+      SSH_HOST: { required: false }
+      SSH_PORT: { required: false }
+      SSH_USER: { required: false }
+      SSH_KEY: { required: false }
+      VERCEL_TOKEN: { required: false }
+      VERCEL_ORG_ID: { required: false }
+      VERCEL_PROJECT_ID: { required: false }
+      NETLIFY_AUTH_TOKEN: { required: false }
+      NETLIFY_SITE_ID: { required: false }
+      SUPABASE_ACCESS_TOKEN: { required: false }
+      SUPABASE_PROJECT_REF: { required: false }
+      SUPABASE_DB_PASSWORD: { required: false }
+      TELEGRAM_BOT_TOKEN: { required: false }
+      TELEGRAM_CHAT_ID: { required: false }
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check this project's secrets are set
+        id: precheck
+        env:
+          T: ${{ inputs.target }}
+          FTP_SERVER: ${{ secrets.FTP_SERVER }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          ok=n
+          case "$T" in
+            cpanel-ftp) if [ -n "$FTP_SERVER" ] && [ -n "$FTP_PASSWORD" ]; then ok=y; fi ;;
+            cpanel-ssh) if [ -n "$SSH_HOST" ] && [ -n "$SSH_KEY" ]; then ok=y; fi ;;
+            vercel)     if [ -n "$VERCEL_TOKEN" ]; then ok=y; fi ;;
+            netlify)    if [ -n "$NETLIFY_AUTH_TOKEN" ]; then ok=y; fi ;;
+            supabase)   if [ -n "$SUPABASE_ACCESS_TOKEN" ]; then ok=y; fi ;;
+            *) echo "::error::Unknown target '$T'"; exit 1 ;;
+          esac
+          if [ "$ok" = "y" ]; then echo "ready=true" >> "$GITHUB_OUTPUT"
+          else echo "ready=false" >> "$GITHUB_OUTPUT"
+               echo "::warning::Deploy skipped: this project's secrets for '$T' aren't set yet (see deploy-kit README)."
+          fi
+
+      - name: Set up Node
+        if: steps.precheck.outputs.ready == 'true' && (inputs.install_command != '' || inputs.build_command != '' || inputs.target == 'vercel' || inputs.target == 'netlify')
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Install
+        if: steps.precheck.outputs.ready == 'true' && (inputs.install_command != '')
+        run: ${{ inputs.install_command }}
+
+      - name: Build
+        if: steps.precheck.outputs.ready == 'true' && (inputs.build_command != '' && (inputs.target == 'cpanel-ftp' || inputs.target == 'cpanel-ssh' || inputs.target == 'netlify'))
+        run: ${{ inputs.build_command }}
+
+      # ---------------------------------------------------------------- cPanel over FTPS
+      - name: Deploy to cPanel (FTPS)
+        if: steps.precheck.outputs.ready == 'true' && (inputs.target == 'cpanel-ftp')
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          local-dir: ${{ inputs.output_dir == '.' && './' || format('./{0}/', inputs.output_dir) }}
+          server-dir: ${{ inputs.server_dir }}
+          exclude: |
+            **/.git*
+            **/.git*/**
+            **/.github/**
+            **/node_modules/**
+            **/.DS_Store
+            README.md
+            ${{ inputs.exclude }}
+
+      # ---------------------------------------------------------------- cPanel / VPS over SSH
+      - name: Deploy over SSH (rsync)
+        if: steps.precheck.outputs.ready == 'true' && (inputs.target == 'cpanel-ssh')
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          mkdir -p ~/.ssh && echo "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          PORT="${SSH_PORT:-22}"
+          ssh-keyscan -p "$PORT" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          printf '%s\n' .git .github node_modules .DS_Store README.md > /tmp/exclude.txt
+          printf '%s\n' "${{ inputs.exclude }}" >> /tmp/exclude.txt
+          SRC="${{ inputs.output_dir }}"; SRC="${SRC%/}/"
+          DEST="${{ inputs.server_dir }}"; DEST="${DEST#/}"
+          rsync -az --delete --exclude-from=/tmp/exclude.txt -e "ssh -i ~/.ssh/deploy_key -p $PORT" \
+            "$SRC" "$SSH_USER@$SSH_HOST:$DEST"
+
+      # ---------------------------------------------------------------- Vercel
+      - name: Deploy to Vercel
+        if: steps.precheck.outputs.ready == 'true' && (inputs.target == 'vercel')
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          npx --yes vercel@latest pull --yes --environment=production --token="$VERCEL_TOKEN"
+          npx --yes vercel@latest build --prod --token="$VERCEL_TOKEN"
+          npx --yes vercel@latest deploy --prebuilt --prod --token="$VERCEL_TOKEN"
+
+      # ---------------------------------------------------------------- Netlify
+      - name: Deploy to Netlify
+        if: steps.precheck.outputs.ready == 'true' && (inputs.target == 'netlify')
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+        run: npx --yes netlify-cli@latest deploy --prod --dir="${{ inputs.output_dir }}" --site="$NETLIFY_SITE_ID"
+
+      # ---------------------------------------------------------------- Supabase
+      - name: Set up Supabase CLI
+        if: steps.precheck.outputs.ready == 'true' && inputs.target == 'supabase'
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      - name: Deploy to Supabase (migrations + edge functions)
+        if: steps.precheck.outputs.ready == 'true' && inputs.target == 'supabase'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: |
+          supabase link --project-ref "${{ secrets.SUPABASE_PROJECT_REF }}"
+          if [ -d supabase/migrations ]; then supabase db push; fi
+          if [ -d supabase/functions ]; then supabase functions deploy; fi
+
+      # ---------------------------------------------------------------- check the live site
+      - name: Check the live site
+        if: steps.precheck.outputs.ready == 'true' && (inputs.site_url != '')
+        run: |
+          sleep 5
+          code=$(curl -s -o /tmp/page.html -w '%{http_code}' -L --max-time 30 "${{ inputs.site_url }}")
+          echo "HTTP $code"
+          [ "$code" -lt 400 ] || { echo "Site returned HTTP $code"; exit 1; }
+          if [ -n "${{ inputs.expect_text }}" ]; then
+            grep -qi -- "${{ inputs.expect_text }}" /tmp/page.html || { echo "Expected text not found on page"; exit 1; }
+          fi
+
+      # ---------------------------------------------------------------- tell Riaan
+      - name: Telegram result
+        if: always()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATUS: ${{ job.status }}
+          READY: ${{ steps.precheck.outputs.ready }}
+          MSG: ${{ github.event.head_commit.message }}
+        run: |
+          [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || exit 0
+          RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          FIRST_LINE=$(printf '%s' "$MSG" | head -n1 | cut -c1-120)
+          if [ "$READY" = "false" ]; then
+            TEXT="⚠️ ${{ inputs.site_name }}: deploy skipped, its GitHub secrets aren't set yet."
+          elif [ "$STATUS" = "success" ]; then
+            TEXT="✅ ${{ inputs.site_name }} deployed (${{ inputs.target }})"
+          else
+            TEXT="🔴 ${{ inputs.site_name }} deploy FAILED (${{ inputs.target }}). Details: $RUN"
+          fi
+          [ -n "$FIRST_LINE" ] && TEXT="$TEXT
+          ${FIRST_LINE}"
+          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=${TEXT}" \
+            --data-urlencode "disable_web_page_preview=true" > /dev/null

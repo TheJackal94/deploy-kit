@@ -1,0 +1,21 @@
+# Copy to .github/workflows/deploy.yml in a project. Change the "with:" lines; that's all.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # "Run workflow" button in GitHub, for a manual redeploy
+
+jobs:
+  deploy:
+    uses: TheJackal94/deploy-kit/.github/workflows/deploy.yml@main
+    with:
+      target: cpanel-ftp            # cpanel-ftp | cpanel-ssh | vercel | netlify | supabase
+      site_name: My Site
+      site_url: https://example.co.za
+      expect_text: ""               # optional: text that must appear on the live page
+      output_dir: .                 # "." for plain HTML; "dist" / "build" for React/Vite
+      server_dir: /public_html/     # cPanel only
+      build_command: ""             # e.g. "npm run build"; empty for plain HTML
+      install_command: ""           # e.g. "npm ci"
+    secrets: inherit
