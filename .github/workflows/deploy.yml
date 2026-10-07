@@ -3,6 +3,7 @@
 #
 #   target: cpanel-ftp   any cPanel host (Axxess, Afrihost, ...) over FTPS. Uploads only changed files.
 #           cpanel-ssh   cPanel/VPS with SSH: rsync, faster, can delete removed files safely.
+#           sftp         hosts with SFTP but no FTPS (xneelo, ...): password login, same FTP_* secrets.
 #           vercel       Vercel project (static, Next.js, etc.).
 #           netlify      Netlify site.
 #           supabase     Supabase database migrations + edge functions.
@@ -27,6 +28,7 @@ on:
       FTP_SERVER: { required: false }
       FTP_USERNAME: { required: false }
       FTP_PASSWORD: { required: false }
+      FTP_PORT: { required: false }   # sftp only, default 22
       SSH_HOST: { required: false }
       SSH_PORT: { required: false }
       SSH_USER: { required: false }
@@ -67,7 +69,7 @@ jobs:
         run: |
           ok=n
           case "$T" in
-            cpanel-ftp) if [ -n "$FTP_SERVER" ] && [ -n "$FTP_PASSWORD" ]; then ok=y; fi ;;
+            cpanel-ftp|sftp) if [ -n "$FTP_SERVER" ] && [ -n "$FTP_PASSWORD" ]; then ok=y; fi ;;
             cpanel-ssh) if [ -n "$SSH_HOST" ] && [ -n "$SSH_KEY" ]; then ok=y; fi ;;
             vercel)     if [ -n "$VERCEL_TOKEN" ]; then ok=y; fi ;;
             netlify)    if [ -n "$NETLIFY_AUTH_TOKEN" ]; then ok=y; fi ;;
@@ -90,7 +92,7 @@ jobs:
         run: ${{ inputs.install_command }}
 
       - name: Build
-        if: steps.precheck.outputs.ready == 'true' && (inputs.build_command != '' && (inputs.target == 'cpanel-ftp' || inputs.target == 'cpanel-ssh' || inputs.target == 'netlify'))
+        if: steps.precheck.outputs.ready == 'true' && (inputs.build_command != '' && (inputs.target == 'cpanel-ftp' || inputs.target == 'cpanel-ssh' || inputs.target == 'sftp' || inputs.target == 'netlify'))
         run: ${{ inputs.build_command }}
 
       # ---------------------------------------------------------------- safety lock
@@ -98,7 +100,7 @@ jobs:
       # repo's secrets points at another project's folder, refuse before touching anything.
       - name: Safety lock (is this the right site?)
         id: lock
-        if: steps.precheck.outputs.ready == 'true' && (inputs.target == 'cpanel-ftp' || inputs.target == 'cpanel-ssh')
+        if: steps.precheck.outputs.ready == 'true' && (inputs.target == 'cpanel-ftp' || inputs.target == 'cpanel-ssh' || inputs.target == 'sftp')
         env:
           T: ${{ inputs.target }}
           REPO: ${{ github.repository }}
@@ -106,12 +108,34 @@ jobs:
           FTP_SERVER: ${{ secrets.FTP_SERVER }}
           FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_PORT: ${{ secrets.FTP_PORT }}
           SSH_KEY: ${{ secrets.SSH_KEY }}
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
         run: |
           d="${DIR#./}"; d="${d#/}"; d="${d%/}"; path="${d:+$d/}.deploy-owner"
+          if [ "$T" = "sftp" ]; then
+            sudo apt-get -qq update >/dev/null && sudo apt-get -qq install -y lftp >/dev/null
+            export LFTP_PASSWORD="$FTP_PASSWORD"
+            lf() { lftp --env-password -u "$FTP_USERNAME" -p "${FTP_PORT:-22}" "sftp://$FTP_SERVER" \
+                     -e "set sftp:auto-confirm yes; set net:max-retries 2; set net:timeout 30; set cmd:fail-exit yes; $1; bye"; }
+            # Login + folder must work; a missing marker is fine (first deploy).
+            if ! lf "cd '${d:-.}'" 2>/tmp/lockerr; then
+              echo "::error::Couldn't log in over SFTP or the folder '${d:-.}' doesn't exist: $(cat /tmp/lockerr)"
+              exit 1
+            fi
+            owner=$(lf "cat '$path'" 2>/dev/null || true)
+            owner=$(printf '%s' "$owner" | tr -d '\r\n ')
+            if [ -n "$owner" ] && [ "$owner" != "$REPO" ]; then
+              echo "locked_by=$owner" >> "$GITHUB_OUTPUT"
+              echo "::error::Refused: that host folder belongs to $owner, not $REPO. Check this repo's FTP secrets."
+              exit 1
+            fi
+            echo "first=$([ -z "$owner" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+            echo "Safety lock OK (${owner:-no marker yet, this deploy will set it})"
+            exit 0
+          fi
           # --insecure: still encrypted (FTPS), but shared cPanel servers often present a certificate issued for
           # another hostname; the FTP deploy step accepts it the same way.
           set +e
@@ -178,6 +202,32 @@ jobs:
           rsync -az --delete --exclude-from=/tmp/exclude.txt -e "ssh -i ~/.ssh/deploy_key -p $PORT" \
             "$SRC" "$SSH_USER@$SSH_HOST:$DEST"
 
+      # ---------------------------------------------------------------- SFTP (password), e.g. xneelo
+      # Uploads new and changed files; never deletes anything on the server.
+      - name: Deploy over SFTP
+        if: steps.precheck.outputs.ready == 'true' && (inputs.target == 'sftp')
+        env:
+          FTP_SERVER: ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_PORT: ${{ secrets.FTP_PORT }}
+          SRC: ${{ inputs.output_dir }}
+          DEST: ${{ inputs.server_dir }}
+          EXTRA: ${{ inputs.exclude }}
+        run: |
+          export LFTP_PASSWORD="$FTP_PASSWORD"
+          SRC="${SRC%/}/"; DEST="${DEST#./}"; DEST="${DEST#/}"; DEST="${DEST:-.}"
+          # Always skip git/CI files, the readme and the lock marker. Extra globs: "_source/**" -> skip folder _source.
+          X="-x '^\.git' -x 'node_modules/' -x '\.DS_Store$' -x '^README\.md$' -x '^\.deploy-owner$'"
+          while IFS= read -r g; do
+            g="${g%%#*}"; g="${g//[[:space:]]/}"; [ -z "$g" ] && continue
+            g="${g%/**}"; g="${g%/}"
+            X="$X -X '$g' -X '$g/'"
+          done <<< "$EXTRA"
+          echo "Excludes: $X"
+          lftp --env-password -u "$FTP_USERNAME" -p "${FTP_PORT:-22}" "sftp://$FTP_SERVER" \
+            -e "set sftp:auto-confirm yes; set net:max-retries 3; set cmd:fail-exit yes; mirror -R --no-perms --parallel=4 --verbose $X '$SRC' '$DEST'; bye"
+
       # ---------------------------------------------------------------- claim the folder (first deploy)
       - name: Set the safety-lock marker
         if: steps.precheck.outputs.ready == 'true' && steps.lock.outputs.first == 'true'
@@ -188,12 +238,17 @@ jobs:
           FTP_SERVER: ${{ secrets.FTP_SERVER }}
           FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_PORT: ${{ secrets.FTP_PORT }}
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
         run: |
           d="${DIR#./}"; d="${d#/}"; d="${d%/}"; path="${d:+$d/}.deploy-owner"
-          if [ "$T" = "cpanel-ftp" ]; then
+          if [ "$T" = "sftp" ]; then
+            printf '%s\n' "$REPO" > /tmp/deploy-owner
+            LFTP_PASSWORD="$FTP_PASSWORD" lftp --env-password -u "$FTP_USERNAME" -p "${FTP_PORT:-22}" "sftp://$FTP_SERVER" \
+              -e "set sftp:auto-confirm yes; set cmd:fail-exit yes; put /tmp/deploy-owner -o '$path'; bye"
+          elif [ "$T" = "cpanel-ftp" ]; then
             printf '%s\n' "$REPO" | curl -sS --ssl-reqd --insecure --tls-max 1.2 --max-time 60 --user "$FTP_USERNAME:$FTP_PASSWORD" \
               -T - "ftp://$FTP_SERVER/$path"
           else

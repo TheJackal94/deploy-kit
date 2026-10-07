@@ -8,6 +8,7 @@ deploys to wherever it's hosted, checks the live site loads, and sends a ✅ or 
 | target | For | Secrets the project needs |
 |---|---|---|
 | `cpanel-ftp` | Any cPanel host (Axxess, Afrihost, …). Uploads only changed files. | `FTP_SERVER`, `FTP_USERNAME`, `FTP_PASSWORD` |
+| `sftp` | Hosts with SFTP but no encrypted FTP, e.g. **xneelo**. Password login; uploads new and changed files, never deletes. | `FTP_SERVER`, `FTP_USERNAME`, `FTP_PASSWORD` (+ `FTP_PORT` if not 22) |
 | `cpanel-ssh` | cPanel or a VPS with SSH. Faster; also removes deleted files. | `SSH_HOST`, `SSH_USER`, `SSH_KEY` (+ `SSH_PORT` if not 22) |
 | `vercel` | Vercel projects (static, Next.js, …) | `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID` |
 | `netlify` | Netlify sites | `NETLIFY_AUTH_TOKEN`, `NETLIFY_SITE_ID` |
